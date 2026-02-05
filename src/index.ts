@@ -104,7 +104,22 @@ function docToObject(doc: FirebaseFirestore.DocumentSnapshot) {
   };
 }
 
+function handleGetEnvironment() {
+  return {
+    type: "emulator",
+    projectId: FIREBASE_PROJECT_ID,
+    firestoreHost: FIRESTORE_EMULATOR_HOST,
+    emulatorHub: FIREBASE_EMULATOR_HUB,
+    note: "This is a local emulator environment - safe for testing",
+  };
+}
+
 const tools = [
+  {
+    name: "get_environment",
+    description: "Get information about the current Firebase environment",
+    inputSchema: { type: "object" as const, properties: {} },
+  },
   {
     name: "list_collections",
     description: "List top-level collections in Firestore",
@@ -276,6 +291,9 @@ async function main() {
     try {
       let result: any;
       switch (name) {
+        case "get_environment":
+          result = handleGetEnvironment();
+          break;
         case "list_collections":
           result = await handleListCollections();
           break;
