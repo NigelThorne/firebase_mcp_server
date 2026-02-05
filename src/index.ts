@@ -187,15 +187,20 @@ const tools = [
     },
   },
   {
+    name: "list_functions",
+    description: "List all Cloud Functions registered in the emulator",
+    inputSchema: { type: "object" as const, properties: {} },
+  },
+  {
     name: "get_function_logs",
-    description: "Get Firebase function logs with optional grep-style filtering",
+    description: "Get Firebase function logs. Returns 20 lines by default - use filters (pattern, level, functionName) to narrow results before increasing limit.",
     inputSchema: {
       type: "object" as const,
       properties: {
         pattern: { type: "string", description: "Regex pattern to filter log messages" },
         level: { type: "string", enum: ["DEBUG", "INFO", "WARN", "ERROR"], description: "Filter by log level" },
         functionName: { type: "string", description: "Filter by function name" },
-        limit: { type: "number", description: "Max log entries to return (default: 50)" },
+        limit: { type: "number", description: "Max log entries to return (default: 20)" },
         since: { type: "string", description: "ISO timestamp - only logs after this time" },
       },
     },
@@ -254,7 +259,7 @@ async function handleGetFunctionLogs(
   pattern?: string,
   level?: string,
   functionName?: string,
-  limit = 50,
+  limit = 20,
   since?: string
 ) {
   await pollLogs();
@@ -274,6 +279,34 @@ async function handleGetFunctionLogs(
     filtered = filtered.filter((log) => regex.test(log.message));
   }
   return filtered.slice(-limit);
+}
+
+async function handleListFunctions() {
+  try {
+    const response = await fetch(`http://${FIREBASE_EMULATOR_HUB}/emulators`);
+    if (!response.ok) return [];
+    const data = await response.json();
+    const functionsEmulator = data.functions;
+    if (!functionsEmulator) return [];
+
+    // Try to get function list from emulator
+    const functionsUrl = `http://${functionsEmulator.host || 'localhost'}:${functionsEmulator.port}/__/functions/list`;
+    const fnResponse = await fetch(functionsUrl);
+    if (fnResponse.ok) {
+      const fnData = await fnResponse.json();
+      return (fnData.functions || []).map((fn: any) => ({
+        name: fn.name || fn.id,
+        trigger: fn.trigger?.httpsTrigger ? "https" : fn.trigger?.eventTrigger?.eventType || "unknown",
+        region: fn.region || "us-central1",
+      }));
+    }
+
+    // Fallback: extract unique function names from logs
+    const uniqueFunctions = [...new Set(logBuffer.map(l => l.function).filter(Boolean))];
+    return uniqueFunctions.map(name => ({ name, trigger: "unknown", region: "unknown" }));
+  } catch {
+    return [];
+  }
 }
 
 async function main() {
@@ -314,6 +347,9 @@ async function main() {
             args?.orderDirection as "asc" | "desc",
             args?.limit as number
           );
+          break;
+        case "list_functions":
+          result = await handleListFunctions();
           break;
         case "get_function_logs":
           result = await handleGetFunctionLogs(
