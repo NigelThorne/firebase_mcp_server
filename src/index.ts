@@ -1,4 +1,5 @@
 #!/usr/bin/env node
+import WebSocket from "ws";
 import { Server } from "@modelcontextprotocol/sdk/server/index.js";
 import { StdioServerTransport } from "@modelcontextprotocol/sdk/server/stdio.js";
 import {
@@ -7,24 +8,29 @@ import {
 } from "@modelcontextprotocol/sdk/types.js";
 import { initializeApp, App } from "firebase-admin/app";
 import { getFirestore, Firestore } from "firebase-admin/firestore";
+import { getAuth, Auth } from "firebase-admin/auth";
 
 // Config from env
 const FIRESTORE_EMULATOR_HOST = process.env.FIRESTORE_EMULATOR_HOST || "localhost:8080";
 const FIREBASE_PROJECT_ID = process.env.FIREBASE_PROJECT_ID || "demo-project";
 const FIREBASE_EMULATOR_HUB = process.env.FIREBASE_EMULATOR_HUB || "localhost:4000";
+const AUTH_EMULATOR_HOST = process.env.FIREBASE_AUTH_EMULATOR_HOST || "localhost:9099";
 
 // Set emulator env before init
 process.env.FIRESTORE_EMULATOR_HOST = FIRESTORE_EMULATOR_HOST;
+process.env.FIREBASE_AUTH_EMULATOR_HOST = AUTH_EMULATOR_HOST;
 
 let app: App;
 let db: Firestore;
+let adminAuth: Auth;
 
 function initFirebase() {
   app = initializeApp({ projectId: FIREBASE_PROJECT_ID });
   db = getFirestore(app);
+  adminAuth = getAuth(app);
 }
 
-// In-memory log buffer (populated by polling emulator)
+// In-memory log buffer (populated via WebSocket from emulator hub)
 interface LogEntry {
   timestamp: string;
   level: string;
@@ -33,67 +39,85 @@ interface LogEntry {
 }
 
 let logBuffer: LogEntry[] = [];
+
 const MAX_LOG_BUFFER = 1000;
-let logPollingActive = false;
 
-async function fetchEmulatorLogs(): Promise<LogEntry[]> {
-  try {
-    const response = await fetch(`http://${FIREBASE_EMULATOR_HUB}/functions/logs`);
-    if (!response.ok) return [];
-    const data = await response.json();
-    return (data.logs || []).map((log: any) => ({
-      timestamp: log.timestamp || new Date().toISOString(),
-      level: log.level || "INFO",
-      message: log.message || log.data || JSON.stringify(log),
-      function: log.function || log.functionName,
-    }));
-  } catch {
-    return [];
-  }
-}
 
-async function fetchLogsFromHub(): Promise<LogEntry[]> {
-  try {
-    const response = await fetch(`http://${FIREBASE_EMULATOR_HUB}/emulators`);
-    if (!response.ok) return [];
-    const data = await response.json();
-    const functionsEmulator = data.functions;
-    if (functionsEmulator?.host && functionsEmulator?.port) {
-      const logsResponse = await fetch(
-        `http://${functionsEmulator.host}:${functionsEmulator.port}/__/functions/logs`
-      );
-      if (logsResponse.ok) {
-        const logsData = await logsResponse.json();
-        return (logsData || []).map((log: any) => ({
-          timestamp: log.timestamp || new Date().toISOString(),
-          level: log.level || "INFO",
-          message: typeof log === "string" ? log : log.message || JSON.stringify(log),
-          function: log.function,
-        }));
+
+function connectToEmulatorLogs() {
+  const wsUrl = `ws://${FIREBASE_EMULATOR_HUB}`;
+  let ws: WebSocket;
+  let reconnectTimeout: NodeJS.Timeout | null = null;
+
+  function connect() {
+    ws = new WebSocket(wsUrl);
+
+    ws.on("open", () => {
+      console.error(`Connected to emulator hub WebSocket at ${wsUrl}`);
+    });
+
+    ws.on("message", (data: WebSocket.Data) => {
+      try {
+        const msg = JSON.parse(data.toString());
+        // Hub sends log entries with structure like:
+        // { type: "functions-log", data: { timestamp, level, message, ... } }
+        // or { origin: "functions", ... }
+        const entry = parseLogMessage(msg);
+        if (entry) {
+          logBuffer.push(entry);
+          if (logBuffer.length > MAX_LOG_BUFFER) {
+            logBuffer = logBuffer.slice(-MAX_LOG_BUFFER);
+          }
+        }
+      } catch {
+        // Ignore unparseable messages
       }
-    }
-  } catch {
-    // Silent fail
+    });
+
+    ws.on("close", () => {
+      console.error("Emulator hub WebSocket closed, reconnecting in 3s...");
+      scheduleReconnect();
+    });
+
+    ws.on("error", () => {
+      // Will trigger close event, which handles reconnect
+    });
   }
-  return [];
+
+  function scheduleReconnect() {
+    if (reconnectTimeout) return;
+    reconnectTimeout = setTimeout(() => {
+      reconnectTimeout = null;
+      connect();
+    }, 3000);
+  }
+
+  connect();
 }
 
-async function pollLogs() {
-  if (logPollingActive) return;
-  logPollingActive = true;
-  
-  const logs = await fetchEmulatorLogs();
-  if (logs.length === 0) {
-    const altLogs = await fetchLogsFromHub();
-    logBuffer = [...logBuffer, ...altLogs].slice(-MAX_LOG_BUFFER);
-  } else {
-    logBuffer = [...logBuffer, ...logs].slice(-MAX_LOG_BUFFER);
-  }
-  
-  logPollingActive = false;
+function parseLogMessage(msg: any): LogEntry | null {
+  // Shape: { level, data: { metadata: { emulator, function, message } }, timestamp, message }
+  const metadata = msg.data?.metadata || {};
+  const functionName = metadata.function?.name;
+  const emulator = metadata.emulator?.name;
+
+  const text = msg.message;
+  if (!text) return null;
+
+  const message = typeof text === "string" ? text : JSON.stringify(text);
+  // Strip ANSI escape codes
+  const cleanMessage = message.replace(/\x1b\[[0-9;]*m/g, "").trim();
+  if (!cleanMessage) return null;
+
+  return {
+    timestamp: msg.timestamp || new Date().toISOString(),
+    level: msg.level?.toUpperCase() || "INFO",
+    message: cleanMessage,
+    function: functionName || emulator || undefined,
+  };
 }
 
-setInterval(pollLogs, 2000);
+connectToEmulatorLogs();
 
 function docToObject(doc: FirebaseFirestore.DocumentSnapshot) {
   if (!doc.exists) return null;
@@ -191,6 +215,17 @@ const tools = [
     description: "List all Cloud Functions registered in the emulator",
     inputSchema: { type: "object" as const, properties: {} },
   },
+
+  {
+    name: "get_auth_token",
+    description: "Get an ID token for a user in the Auth emulator. Lists users if no uid provided.",
+    inputSchema: {
+      type: "object" as const,
+      properties: {
+        uid: { type: "string", description: "User UID. If omitted, lists available users instead." },
+      },
+    },
+  },
   {
     name: "get_function_logs",
     description: "Get Firebase function logs. Returns 20 lines by default - use filters (pattern, level, functionName) to narrow results before increasing limit.",
@@ -262,7 +297,6 @@ async function handleGetFunctionLogs(
   limit = 20,
   since?: string
 ) {
-  await pollLogs();
   let filtered = [...logBuffer];
   if (since) {
     const sinceTime = new Date(since).getTime();
@@ -279,6 +313,37 @@ async function handleGetFunctionLogs(
     filtered = filtered.filter((log) => regex.test(log.message));
   }
   return filtered.slice(-limit);
+}
+
+async function handleGetAuthToken(uid?: string) {
+  if (!uid) {
+    // List users so the caller can pick one
+    const result = await adminAuth.listUsers(20);
+    return {
+      message: "No uid provided. Available users:",
+      users: result.users.map((u) => ({
+        uid: u.uid,
+        email: u.email || undefined,
+        displayName: u.displayName || undefined,
+      })),
+    };
+  }
+
+  // Create a custom token and exchange it for an ID token via the emulator REST API
+  const customToken = await adminAuth.createCustomToken(uid);
+  const resp = await fetch(
+    `http://${AUTH_EMULATOR_HOST}/identitytoolkit.googleapis.com/v1/accounts:signInWithCustomToken?key=fake-api-key`,
+    {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({ token: customToken, returnSecureToken: true }),
+    }
+  );
+  const data = await resp.json();
+  if (!data.idToken) {
+    throw new Error(`Failed to get ID token: ${JSON.stringify(data)}`);
+  }
+  return { uid, idToken: data.idToken };
 }
 
 async function handleListFunctions() {
@@ -348,6 +413,9 @@ async function main() {
             args?.limit as number
           );
           break;
+        case "get_auth_token":
+          result = await handleGetAuthToken(args?.uid as string | undefined);
+          break;
         case "list_functions":
           result = await handleListFunctions();
           break;
@@ -360,6 +428,7 @@ async function main() {
             args?.since as string
           );
           break;
+
         default:
           throw new Error(`Unknown tool: ${name}`);
       }
